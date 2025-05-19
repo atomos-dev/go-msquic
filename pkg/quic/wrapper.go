@@ -2,10 +2,12 @@ package quic
 
 /*
 #cgo pkg-config: msquic
+
 #cgo noescape ShutdownConnection
 #cgo noescape ShutdownStream
 #cgo noescape AbortStream
 #cgo noescape CreateStream
+#cgo noescape StreamReceiveComplete
 #cgo noescape StartStream
 #cgo noescape LoadListenConfiguration
 #cgo noescape Listen
@@ -19,6 +21,7 @@ package quic
 #cgo nocallback ShutdownStream
 #cgo nocallback AbortStream
 #cgo nocallback CreateStream
+#cgo nocallback StreamReceiveComplete
 #cgo nocallback StartStream
 #cgo nocallback LoadListenConfiguration
 #cgo nocallback Listen
@@ -26,7 +29,6 @@ package quic
 #cgo nocallback DialConnection
 #cgo nocallback MsQuicSetup
 #cgo nocallback GetRemoteAddr
-#cgo nocallback StreamWrite
 
 #include "c/msquic.c"
 */
@@ -47,6 +49,7 @@ var connections sync.Map //map[C.HQUIC]MsQuicConn
 
 var perfCounterNames = []string{
 	"QUIC_PERF_COUNTER_CONN_CREATED",
+
 	"QUIC_PERF_COUNTER_CONN_HANDSHAKE_FAIL",
 	"QUIC_PERF_COUNTER_CONN_APP_REJECT",
 	"QUIC_PERF_COUNTER_CONN_RESUMED",
@@ -228,12 +231,16 @@ func cAbortStream(s C.HQUIC) {
 	C.AbortStream(s)
 }
 
-func cStreamWrite(s C.HQUIC, cArray *C.uint8_t, size C.int64_t) C.int64_t {
-	return C.StreamWrite(s, cArray, size)
+func cStreamWrite(c, s C.HQUIC, cArray *C.uint8_t, size C.int64_t) C.int64_t {
+	return C.StreamWrite(c, s, cArray, size)
 }
 
 func cCreateStream(c C.HQUIC) C.HQUIC {
 	return C.CreateStream(c)
+}
+
+func cStreamReceiveComplete(s C.HQUIC, size C.uint64_t) {
+	C.StreamReceiveComplete(s, size)
 }
 
 func cStartStream(s C.HQUIC, fail C.int8_t) int64 {

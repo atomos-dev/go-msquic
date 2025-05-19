@@ -14,12 +14,12 @@
 // Go bindings
 extern void newConnectionCallback(HQUIC, HQUIC);
 extern void newStreamCallback(HQUIC, HQUIC);
-extern void newReadCallback(HQUIC, HQUIC, uint8_t *data, int64_t len);
+extern void newReadCallback(HQUIC, HQUIC, const QUIC_BUFFER *data, int64_t len);
 extern void closeConnectionCallback(HQUIC);
 extern void closePeerConnectionCallback(HQUIC);
 extern void closeStreamCallback(HQUIC,HQUIC);
 extern void closePeerStreamCallback(HQUIC,HQUIC);
-extern void ackPeerStreamCallback(HQUIC,HQUIC);
+extern int abortStreamCallback(HQUIC,HQUIC);
 
 HQUIC Registration = NULL;
 const QUIC_API_TABLE* MsQuic = NULL;
@@ -39,8 +39,14 @@ struct QUICConfig {
 	int MaxBytesPerKey;
 };
 
+void
+AbortStream(HQUIC stream) {
+	MsQuic->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+}
+
 int64_t
 StreamWrite(
+    _In_ HQUIC Connection,
     _In_ HQUIC Stream,
 	_In_ uint8_t *array,
 	_In_ int64_t len
@@ -60,10 +66,19 @@ StreamWrite(
     if (QUIC_FAILED(Status = MsQuic->StreamSend(Stream, SendBuffer, 1, QUIC_SEND_FLAG_NONE, SendBuffer))) {
         printf("[%p]StreamSend failed, 0x%x!\n", Stream, Status);
         free(SendBufferRaw);
+		//abortStreamCallback(Connection, Stream);
+		AbortStream(Stream);
 		return -1;
     }
 	return len;
 }
+
+void
+ShutdownStream(HQUIC stream) {
+	// This only shutdown sending part
+	MsQuic->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0);
+}
+
 
 _IRQL_requires_max_(DISPATCH_LEVEL)
 _Function_class_(QUIC_STREAM_CALLBACK)
@@ -88,22 +103,29 @@ StreamCallback(
 		if (LOGS_ENABLED) {
 			printf("[strm][%p] Data received, count: %d\n", Stream, Event->RECEIVE.BufferCount);
 		}
-		for (uint32_t i = 0; i < Event->RECEIVE.BufferCount; i++) {
-			newReadCallback(Context, Stream, Event->RECEIVE.Buffers[i].Buffer, Event->RECEIVE.Buffers[i].Length);
+		if (Event->RECEIVE.BufferCount > 0) {
+			newReadCallback(Context, Stream, Event->RECEIVE.Buffers, Event->RECEIVE.BufferCount);
+			return QUIC_STATUS_PENDING;
 		}
-        break;
+		break;
+
+    case QUIC_STREAM_EVENT_SEND_SHUTDOWN_COMPLETE:
+		closePeerStreamCallback(Context, Stream);
+		break;
 	case QUIC_STREAM_EVENT_PEER_RECEIVE_ABORTED:
     case QUIC_STREAM_EVENT_PEER_SEND_ABORTED:
-    case QUIC_STREAM_EVENT_SEND_SHUTDOWN_COMPLETE:
         //
         // The peer aborted its send direction of the stream.
         //
 		if (LOGS_ENABLED) {
 			printf("[strm][%p] Peer aborted\n", Stream);
 		}
-		closePeerStreamCallback(Context, Stream);
-        MsQuic->StreamShutdown(Stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
-        break;
+		//abortStreamCallback(Context, Stream);
+		AbortStream(Stream);
+		break;
+	case QUIC_STREAM_EVENT_PEER_SEND_SHUTDOWN:
+		ShutdownStream(Stream);
+		break;
     case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE:
         //
         // Both directions of the stream have been shut down and MsQuic is done
@@ -133,17 +155,6 @@ AbortConnection(HQUIC connection) {
 	MsQuic->ConnectionShutdown(connection, QUIC_CONNECTION_SHUTDOWN_FLAG_SILENT, 0);
 }
 
-void
-ShutdownStream(HQUIC stream) {
-	// This only shutdown sending part
-	MsQuic->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_GRACEFUL, 0);
-}
-
-void
-AbortStream(HQUIC stream) {
-	MsQuic->StreamShutdown(stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
-}
-
 HQUIC
 CreateStream(
     _In_ HQUIC Connection
@@ -162,6 +173,12 @@ CreateStream(
     }
 
 	return Stream;
+}
+
+void
+StreamReceiveComplete(_In_ HQUIC s, _In_ uint64_t size)
+{
+    MsQuic->StreamReceiveComplete(s, size);
 }
 
 uint64_t

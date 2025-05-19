@@ -8,91 +8,154 @@ import (
 // #include "msquic.h"
 import "C"
 
+func findConnection(c C.HQUIC) (MsQuicConn, bool) {
+
+	res, has := connections.Load(c)
+	if !has {
+		return MsQuicConn{}, false
+	}
+	return res.(MsQuicConn), true
+
+}
+
+func findStream(c, s C.HQUIC) (MsQuicStream, bool) {
+
+	conn, has := findConnection(c)
+	if !has {
+		return MsQuicStream{}, false // already closed
+	}
+
+	//conn.openStream.RLock()
+	//defer conn.openStream.RUnlock()
+	res, has := conn.streams.Load(s)
+	if !has {
+		return MsQuicStream{}, false // already closed
+	}
+
+	return res.(MsQuicStream), true
+}
+
+func findAndDeleteStream(c, s C.HQUIC) (MsQuicStream, bool) {
+
+	conn, has := findConnection(c)
+	if !has {
+		return MsQuicStream{}, false // already closed
+	}
+
+	res, has := conn.streams.LoadAndDelete(s)
+	if !has {
+		return MsQuicStream{}, false // already closed
+	}
+
+	return res.(MsQuicStream), true
+}
+
+func findAndDeleteConnection(c C.HQUIC) (MsQuicConn, bool) {
+
+	res, has := connections.LoadAndDelete(c)
+	if !has {
+		return MsQuicConn{}, false
+	}
+	return res.(MsQuicConn), true
+
+}
+
 //export newConnectionCallback
 func newConnectionCallback(l C.HQUIC, c C.HQUIC) {
 	listener, has := listeners.Load(l)
 	if !has {
+		cAbortConnection(c)
 		return // already closed
+
 	}
 	res := newMsQuicConn(c, listener.(MsQuicListener).failOnOpenStream)
-	connections.Store(c, res)
 
-	listener.(MsQuicListener).acceptQueue <- res
-
+	select {
+	case listener.(MsQuicListener).acceptQueue <- res:
+		_, has := connections.LoadOrStore(c, res)
+		if has {
+			println("PANIC new conn")
+		}
+	default:
+		cAbortConnection(c)
+	}
 }
 
 //export closeConnectionCallback
 func closeConnectionCallback(c C.HQUIC) {
-	res, has := connections.LoadAndDelete(c)
+	conn, has := findAndDeleteConnection(c)
 	if !has {
-		return // already closed
+		cAbortConnection(c)
+		return
 	}
-	res.(MsQuicConn).appClose()
+	conn.appClose()
 }
 
 //export closePeerConnectionCallback
 func closePeerConnectionCallback(c C.HQUIC) {
-
-	res, has := connections.Load(c)
-
+	conn, has := findConnection(c)
 	if !has {
-		return // already closed
+		cAbortConnection(c)
+		return
 	}
-
-	res.(MsQuicConn).peerClose()
+	conn.peerClose()
 }
 
 //export newReadCallback
-func newReadCallback(c, s C.HQUIC, buffer *C.uint8_t, length C.int64_t) {
-	rawConn, has := connections.Load(c)
-	if !has {
-		return // already closed
-	}
-	rawConn.(MsQuicConn).openStream.Lock()
-	defer rawConn.(MsQuicConn).openStream.Unlock()
-	rawStream, has := rawConn.(MsQuicConn).streams.Load(s)
-	if !has {
-		return // already closed
-	}
+func newReadCallback(c, s C.HQUIC, buffers *C.QUIC_BUFFER, bufferCount C.uint32_t) {
 
-	stream := rawStream.(MsQuicStream)
+	stream, has := findStream(c, s)
+	if !has {
+		println("New read cannot find stream")
+		return
+	}
 	state := stream.state
-	state.readBufferAccess.Lock()
-	defer state.readBufferAccess.Unlock()
 
-	if length > 0 {
-		goBuffer := unsafe.Slice((*byte)(unsafe.Pointer(buffer)), length)
-		_, err := state.readBuffer.Write(goBuffer)
-		if err != nil {
-			println("not enough RAM to achieve: ", length)
-			panic(err.Error())
-		}
-	}
-	select {
-	case stream.readSignal <- struct{}{}:
-	default:
+	if stream.ctx.Err() == nil {
+		buffersSlice := make([]C.QUIC_BUFFER, bufferCount)
+		copy(buffersSlice, unsafe.Slice(buffers, bufferCount))
+		go func() {
+			totalLength := C.uint32_t(0)
+			goBuffers := make([][]byte, len(buffersSlice))
+			for i, buffer := range buffersSlice {
+				if buffer.Length == 0 {
+					continue
+				}
+				goBuffers[i] = make([]byte, buffer.Length)
+				cBuffer := unsafe.Slice((*byte)(buffer.Buffer), buffer.Length)
+				copy(goBuffers[i], cBuffer)
+				totalLength += buffer.Length
+			}
+			select {
+			case state.readBuffers <- goBuffers:
+			default:
+			}
+			cStreamReceiveComplete(s, C.uint64_t(totalLength))
+		}()
+	} else {
+		cStreamReceiveComplete(s, C.uint64_t(0))
 	}
 }
 
 //export newStreamCallback
 func newStreamCallback(c, s C.HQUIC) {
-	rawConn, has := connections.Load(c)
+	conn, has := findConnection(c)
 	if !has {
 		cAbortStream(s)
 		return // already closed
 	}
-	conn := rawConn.(MsQuicConn)
-	conn.openStream.Lock()
-	defer conn.openStream.Unlock()
-	if conn.ctx.Err() != nil {
+	conn.openStream.RLock()
+	defer conn.openStream.RUnlock()
+	if conn.ctx.Err() != nil || conn.listening.Load() {
 		cAbortStream(s)
 		return
 	}
 
-	res := newMsQuicStream(s, conn.ctx)
+	res := newMsQuicStream(c, s, conn.ctx)
+
 	select {
 	case conn.acceptStreamQueue <- res:
-		rawConn.(MsQuicConn).streams.Store(s, res)
+		conn.streams.Store(s, res)
 	default:
 		cAbortStream(s)
 	}
@@ -100,38 +163,28 @@ func newStreamCallback(c, s C.HQUIC) {
 
 //export closeStreamCallback
 func closeStreamCallback(c, s C.HQUIC) {
-
-	rawConn, has := connections.Load(c)
+	stream, has := findAndDeleteStream(c, s)
 	if !has {
-		return // already closed
+		return
 	}
-	rawConn.(MsQuicConn).openStream.Lock()
-	defer rawConn.(MsQuicConn).openStream.Unlock()
-	res, has := rawConn.(MsQuicConn).streams.LoadAndDelete(s)
-	if !has {
-		return // already closed
-	}
-
-	stream := res.(MsQuicStream)
 	stream.appClose()
-
 }
 
 //export closePeerStreamCallback
 func closePeerStreamCallback(c, s C.HQUIC) {
-
-	rawConn, has := connections.Load(c)
+	stream, has := findStream(c, s)
 	if !has {
-		return // already closed
+		return
 	}
-	rawConn.(MsQuicConn).openStream.Lock()
-	defer rawConn.(MsQuicConn).openStream.Unlock()
-	res, has := rawConn.(MsQuicConn).streams.LoadAndDelete(s)
+	stream.peerClose()
+}
+
+//export abortStreamCallback
+func abortStreamCallback(c, s C.HQUIC) {
+	stream, has := findStream(c, s)
 	if !has {
-		return // already closed
+		return
+
 	}
-
-	stream := res.(MsQuicStream)
-	stream.appClose()
-
+	stream.abortClose()
 }

@@ -12,7 +12,7 @@ import (
 // #include "msquic.h"
 import "C"
 
-const streamAcceptQueueSize = 100
+const streamAcceptQueueSize = 1000
 
 type Connection interface {
 	OpenStream() (MsQuicStream, error)
@@ -47,9 +47,10 @@ type MsQuicConn struct {
 	cancel            context.CancelFunc
 	remoteAddr        net.UDPAddr
 	shutdown          *atomic.Bool
+	listening         *atomic.Bool
 	streams           *sync.Map //map[C.HQUIC]MsQuicStream
 	failOpenStream    bool
-	openStream        *sync.Mutex
+	openStream        *sync.RWMutex
 }
 
 func newMsQuicConn(c C.HQUIC, failOnOpen bool) MsQuicConn {
@@ -64,82 +65,90 @@ func newMsQuicConn(c C.HQUIC, failOnOpen bool) MsQuicConn {
 		cancel:            cancel,
 		remoteAddr:        net.UDPAddr{IP: ip, Port: port},
 		shutdown:          new(atomic.Bool),
+		listening:         new(atomic.Bool),
 		streams:           new(sync.Map),
 		failOpenStream:    failOnOpen,
-		openStream:        new(sync.Mutex),
+		openStream:        new(sync.RWMutex),
 	}
 }
 
 func (mqc MsQuicConn) Close() error {
 	mqc.cancel()
-	mqc.openStream.Lock()
-	defer mqc.openStream.Unlock()
 	if !mqc.shutdown.Swap(true) {
+		mqc.openStream.Lock()
+		defer mqc.openStream.Unlock()
+		mqc.listening.Store(true)
 		mqc.streams.Range(func(k, v any) bool {
-			println("PANIC1")
-			go v.(MsQuicStream).shutdownClose()
+			println("shut unclosed stream")
+			go v.(MsQuicStream).Close()
 			return true
 		})
-		close(mqc.acceptStreamQueue)
-		for s := range mqc.acceptStreamQueue {
-			println("PANIC12")
-			go s.shutdownClose()
-		}
+		//close(mqc.acceptStreamQueue)
+		//for s := range mqc.acceptStreamQueue {
+		//	println("shut enqueud stream")
+		//	s.Close()
+		//}
 		cShutdownConnection(mqc.conn)
 	}
 	return nil
 }
 
 func (mqc MsQuicConn) peerClose() error {
-	mqc.cancel()
+	mqc.openStream.Lock()
+	defer mqc.openStream.Unlock()
+	mqc.listening.Store(true)
 	return nil
 }
 
 func (mqc MsQuicConn) appClose() error {
 	mqc.cancel()
-	mqc.openStream.Lock()
-	defer mqc.openStream.Unlock()
 	if !mqc.shutdown.Swap(true) {
+		mqc.openStream.Lock()
+		defer mqc.openStream.Unlock()
+		mqc.listening.Store(true)
 		mqc.streams.Range(func(k, v any) bool {
-			println("PANIC2")
+			println("abort unclosed stream")
 			v.(MsQuicStream).abortClose()
 			return true
 		})
-		close(mqc.acceptStreamQueue)
-		for s := range mqc.acceptStreamQueue {
-			println("PANIC3")
-			s.abortClose()
-		}
+		//close(mqc.acceptStreamQueue)
+		//for s := range mqc.acceptStreamQueue {
+		//	println("abort enqueud stream")
+		//	s.abortClose()
+		//}
+		cAbortConnection(mqc.conn)
 	}
 	return nil
 }
 
 func (mqc MsQuicConn) OpenStream() (MsQuicStream, error) {
 	mqc.openStream.Lock()
-	defer mqc.openStream.Unlock()
 
-	if mqc.ctx.Err() != nil {
+	if mqc.ctx.Err() != nil || mqc.listening.Load() {
+		mqc.openStream.Unlock()
 		return MsQuicStream{}, fmt.Errorf("closed connection")
 	}
+
 	stream := cCreateStream(mqc.conn)
 	if stream == nil {
+		mqc.openStream.Unlock()
 		return MsQuicStream{}, fmt.Errorf("stream open error")
 	}
-	res := newMsQuicStream(stream, mqc.ctx)
+	res := newMsQuicStream(mqc.conn, stream, mqc.ctx)
 	var enable C.int8_t
 	if mqc.failOpenStream {
 		enable = C.int8_t(1)
 	} else {
 		enable = C.int8_t(0)
 	}
+	_, loaded := mqc.streams.LoadOrStore(stream, res)
+	if loaded {
+		println("PANIC")
+	}
+	mqc.openStream.Unlock()
 	if cStartStream(stream, enable) == -1 {
-		mqc.streams.Delete(stream)
+		//mqc.streams.Delete(stream)
 		return MsQuicStream{}, fmt.Errorf("stream start error")
-	} else {
-		_, loaded := mqc.streams.LoadOrStore(stream, res)
-		if loaded {
-			println("PANIC")
-		}
 	}
 	return res, nil
 }
