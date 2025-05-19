@@ -29,6 +29,7 @@ package quic
 #cgo nocallback DialConnection
 #cgo nocallback MsQuicSetup
 #cgo nocallback GetRemoteAddr
+#cgo nocallback StreamWrite
 
 #include "c/msquic.c"
 */

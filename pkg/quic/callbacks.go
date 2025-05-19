@@ -42,6 +42,8 @@ func findAndDeleteStream(c, s C.HQUIC) (MsQuicStream, bool) {
 		return MsQuicStream{}, false // already closed
 	}
 
+	//conn.openStream.RLock()
+	//defer conn.openStream.RUnlock()
 	res, has := conn.streams.LoadAndDelete(s)
 	if !has {
 		return MsQuicStream{}, false // already closed
@@ -64,6 +66,7 @@ func findAndDeleteConnection(c C.HQUIC) (MsQuicConn, bool) {
 func newConnectionCallback(l C.HQUIC, c C.HQUIC) {
 	listener, has := listeners.Load(l)
 	if !has {
+		println("Not found listener")
 		cAbortConnection(c)
 		return // already closed
 
@@ -77,28 +80,31 @@ func newConnectionCallback(l C.HQUIC, c C.HQUIC) {
 			println("PANIC new conn")
 		}
 	default:
+		println("Abort new conn")
 		cAbortConnection(c)
 	}
+}
+
+//export freeConnectionCallback
+func freeConnectionCallback(c C.HQUIC) {
+	conn, has := findAndDeleteConnection(c)
+	if !has {
+		println("Not found connection to free")
+		cAbortConnection(c)
+		return
+	}
+	conn.freeACK()
 }
 
 //export closeConnectionCallback
 func closeConnectionCallback(c C.HQUIC) {
-	conn, has := findAndDeleteConnection(c)
-	if !has {
-		cAbortConnection(c)
-		return
-	}
-	conn.appClose()
-}
-
-//export closePeerConnectionCallback
-func closePeerConnectionCallback(c C.HQUIC) {
 	conn, has := findConnection(c)
 	if !has {
+		println("Not found connection to close")
 		cAbortConnection(c)
 		return
 	}
-	conn.peerClose()
+	conn.stopListen()
 }
 
 //export newReadCallback
@@ -122,6 +128,7 @@ func newReadCallback(c, s C.HQUIC, buffers *C.QUIC_BUFFER, bufferCount C.uint32_
 					continue
 				}
 				goBuffers[i] = make([]byte, buffer.Length)
+
 				cBuffer := unsafe.Slice((*byte)(buffer.Buffer), buffer.Length)
 				copy(goBuffers[i], cBuffer)
 				totalLength += buffer.Length
@@ -141,12 +148,14 @@ func newReadCallback(c, s C.HQUIC, buffers *C.QUIC_BUFFER, bufferCount C.uint32_
 func newStreamCallback(c, s C.HQUIC) {
 	conn, has := findConnection(c)
 	if !has {
+		println("Not found connection to open stream")
 		cAbortStream(s)
 		return // already closed
 	}
-	conn.openStream.RLock()
-	defer conn.openStream.RUnlock()
+	//conn.openStream.RLock()
+	//defer conn.openStream.RUnlock()
 	if conn.ctx.Err() != nil || conn.listening.Load() {
+		println("Not found connection to open stream 2")
 		cAbortStream(s)
 		return
 	}
@@ -157,34 +166,28 @@ func newStreamCallback(c, s C.HQUIC) {
 	case conn.acceptStreamQueue <- res:
 		conn.streams.Store(s, res)
 	default:
+		println("Not space")
 		cAbortStream(s)
 	}
 }
 
-//export closeStreamCallback
-func closeStreamCallback(c, s C.HQUIC) {
+//export freeStreamCallback
+func freeStreamCallback(c, s C.HQUIC) {
 	stream, has := findAndDeleteStream(c, s)
 	if !has {
+		println("Not free stream")
 		return
 	}
-	stream.appClose()
+	stream.freeACK()
 }
 
-//export closePeerStreamCallback
-func closePeerStreamCallback(c, s C.HQUIC) {
+//export closeStreamCallback
+func closeStreamCallback(c, s C.HQUIC) {
 	stream, has := findStream(c, s)
 	if !has {
+		println("Not close stream")
 		return
 	}
-	stream.peerClose()
-}
-
-//export abortStreamCallback
-func abortStreamCallback(c, s C.HQUIC) {
-	stream, has := findStream(c, s)
-	if !has {
-		return
-
-	}
-	stream.abortClose()
+	stream.stopWrite()
+	stream.aborted()
 }
