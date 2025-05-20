@@ -33,15 +33,14 @@ type streamState struct {
 	shutdown         atomic.Bool
 	readBufferAccess sync.Mutex
 	readBuffer       bytes.Buffer
+	availBytes       atomic.Int64
 	readDeadline     time.Time
 	writeDeadline    time.Time
 	writeAccess      sync.Mutex
 }
 
 func (ss *streamState) hasReadData() bool {
-	ss.readBufferAccess.Lock()
-	defer ss.readBufferAccess.Unlock()
-	return ss.readBuffer.Len() != 0
+	return ss.availBytes.Load() != 0
 }
 
 type MsQuicStream struct {
@@ -99,6 +98,8 @@ func (mqs MsQuicStream) Read(data []byte) (int, error) {
 	state.readBufferAccess.Lock()
 	defer state.readBufferAccess.Unlock()
 	n, err := state.readBuffer.Read(data)
+	nn := int64(n)
+	state.availBytes.Add(-nn)
 	if n == 0 { // ignore io.EOF
 		return 0, nil
 	}
@@ -111,18 +112,20 @@ func (mqs MsQuicStream) WriteTo(w io.Writer) (int64, error) {
 
 	n := int64(0)
 	var err error
-	for mqs.ctx.Err() == nil {
-		deadline := state.readDeadline
+
+	ctx := mqs.ctx
+	deadline := state.readDeadline
+	if !deadline.IsZero() {
+		if time.Now().After(deadline) {
+			return n, os.ErrDeadlineExceeded
+		}
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithDeadline(ctx, deadline)
+		defer cancel()
+	}
+
+	for {
 		if !state.hasReadData() {
-			ctx := mqs.ctx
-			if !deadline.IsZero() {
-				if time.Now().After(deadline) {
-					return n, os.ErrDeadlineExceeded
-				}
-				var cancel context.CancelFunc
-				ctx, cancel = context.WithDeadline(ctx, deadline)
-				defer cancel()
-			}
 			if !mqs.waitRead(ctx) {
 				if errors.Is(ctx.Err(), context.DeadlineExceeded) {
 					return n, os.ErrDeadlineExceeded
@@ -135,14 +138,11 @@ func (mqs MsQuicStream) WriteTo(w io.Writer) (int64, error) {
 		state.readBufferAccess.Lock()
 		nn, err = state.readBuffer.WriteTo(w)
 		state.readBufferAccess.Unlock()
+		state.availBytes.Add(-nn)
 		n += nn
 		if err != nil {
 			break
 		}
-	}
-
-	if mqs.ctx.Err() != nil {
-		return n, io.EOF
 	}
 
 	return n, err
