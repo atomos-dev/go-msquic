@@ -20,6 +20,8 @@ import "C"
 type Stream interface {
 	Read(data []byte) (int, error)
 	Write(data []byte) (int, error)
+	WriteTo(w io.Writer) (int64, error)
+	ReadFrom(r io.Reader) (int64, error)
 	Close() error
 	SetDeadline(ttl time.Time) error
 	SetReadDeadline(ttl time.Time) error
@@ -33,7 +35,7 @@ type streamState struct {
 	readBuffer       bytes.Buffer
 	readDeadline     time.Time
 	writeDeadline    time.Time
-	closeAccess      sync.Mutex
+	writeAccess      sync.Mutex
 }
 
 func (ss *streamState) hasReadData() bool {
@@ -104,6 +106,64 @@ func (mqs MsQuicStream) Read(data []byte) (int, error) {
 	return n, err
 }
 
+func (mqs MsQuicStream) WriteTo(w io.Writer) (int64, error) {
+	state := mqs.state
+
+	n := int64(0)
+	var err error
+	for mqs.ctx.Err() == nil {
+		deadline := state.readDeadline
+		if !state.hasReadData() {
+			ctx := mqs.ctx
+			if !deadline.IsZero() {
+				if time.Now().After(deadline) {
+					return n, os.ErrDeadlineExceeded
+				}
+				var cancel context.CancelFunc
+				ctx, cancel = context.WithDeadline(ctx, deadline)
+				defer cancel()
+			}
+			if !mqs.waitRead(ctx) {
+				if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+					return n, os.ErrDeadlineExceeded
+				}
+				return n, io.EOF
+			}
+		}
+
+		nn := int64(0)
+		state.readBufferAccess.Lock()
+		nn, err = state.readBuffer.WriteTo(w)
+		state.readBufferAccess.Unlock()
+		n += nn
+		if err != nil {
+			break
+		}
+	}
+
+	if mqs.ctx.Err() != nil {
+		return n, io.EOF
+	}
+
+	return n, err
+}
+
+func (mqs MsQuicStream) ReadFrom(r io.Reader) (n int64, err error) {
+	var buffer [32 * 1024]byte
+	for mqs.ctx.Err() == nil {
+		bn, err := r.Read(buffer[:])
+		if bn != 0 {
+			var nn int
+			nn, err = mqs.Write(buffer[:bn])
+			n += int64(nn)
+		}
+		if err != nil {
+			return n, err
+		}
+	}
+	return n, io.EOF
+}
+
 func (mqs MsQuicStream) waitRead(ctx context.Context) bool {
 	select {
 	case <-ctx.Done():
@@ -115,21 +175,21 @@ func (mqs MsQuicStream) waitRead(ctx context.Context) bool {
 
 func (mqs MsQuicStream) Write(data []byte) (int, error) {
 	state := mqs.state
-	state.closeAccess.Lock()
-	defer state.closeAccess.Unlock()
+	state.writeAccess.Lock()
+	defer state.writeAccess.Unlock()
 	ctx := mqs.ctx
 	if ctx.Err() != nil {
 		return 0, io.EOF
 	}
-	deadline := state.writeDeadline
-	if !deadline.IsZero() {
-		if time.Now().After(deadline) {
-			return 0, os.ErrDeadlineExceeded
-		}
-		var cancel context.CancelFunc
-		ctx, cancel = context.WithDeadline(ctx, deadline)
-		defer cancel()
-	}
+	//deadline := state.writeDeadline
+	//if !deadline.IsZero() {
+	//	if time.Now().After(deadline) {
+	//		return 0, os.ErrDeadlineExceeded
+	//	}
+	//	var cancel context.CancelFunc
+	//	ctx, cancel = context.WithDeadline(ctx, deadline)
+	//	defer cancel()
+	//}
 	offset := 0
 	size := len(data)
 	for offset != len(data) && ctx.Err() == nil {
@@ -142,10 +202,14 @@ func (mqs MsQuicStream) Write(data []byte) (int, error) {
 	}
 	runtime.KeepAlive(data)
 	if ctx.Err() != nil {
-		if errors.Is(ctx.Err(), context.DeadlineExceeded) {
-			return int(offset), os.ErrDeadlineExceeded
+		//if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+		//	return int(offset), os.ErrDeadlineExceeded
+		//}
+		if size != 0 {
+			return int(offset), io.ErrUnexpectedEOF
+		} else {
+			return int(offset), io.EOF
 		}
-		return int(offset), io.ErrUnexpectedEOF
 	}
 	return len(data), nil
 }
@@ -180,16 +244,16 @@ func (mqs MsQuicStream) Close() error {
 func (mqs MsQuicStream) appClose() error {
 	mqs.peerClose()
 	mqs.cancel()
-	mqs.state.closeAccess.Lock()
-	defer mqs.state.closeAccess.Unlock()
+	mqs.state.writeAccess.Lock()
+	defer mqs.state.writeAccess.Unlock()
 	mqs.state.shutdown.Store(true)
 	return nil
 }
 
 func (mqs MsQuicStream) shutdownClose() error {
 	mqs.cancel()
-	mqs.state.closeAccess.Lock()
-	defer mqs.state.closeAccess.Unlock()
+	mqs.state.writeAccess.Lock()
+	defer mqs.state.writeAccess.Unlock()
 	if !mqs.state.shutdown.Swap(true) {
 		cShutdownStream(mqs.stream)
 		select {
@@ -204,8 +268,8 @@ func (mqs MsQuicStream) shutdownClose() error {
 func (mqs MsQuicStream) abortClose() error {
 	mqs.peerClose()
 	mqs.cancel()
-	mqs.state.closeAccess.Lock()
-	defer mqs.state.closeAccess.Unlock()
+	mqs.state.writeAccess.Lock()
+	defer mqs.state.writeAccess.Unlock()
 	if !mqs.state.shutdown.Swap(true) {
 		cAbortStream(mqs.stream)
 	}

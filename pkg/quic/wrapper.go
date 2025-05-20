@@ -248,6 +248,10 @@ func cAbortConnection(c C.HQUIC) {
 	C.AbortConnection(c)
 }
 
+func cStreamReceiveComplete(s C.HQUIC, size C.uint64_t) {
+	C.StreamReceiveComplete(s, size)
+}
+
 func cGetPerfCounters() []uint64 {
 	counters := make([]uint64, C.QUIC_PERF_COUNTER_MAX)
 	C.GetPerfCounters((*C.uint64_t)(unsafe.SliceData(counters)))

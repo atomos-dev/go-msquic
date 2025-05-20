@@ -12,7 +12,7 @@ import (
 // #include "msquic.h"
 import "C"
 
-const streamAcceptQueueSize = 100
+const streamAcceptQueueSize = 1000
 
 type Connection interface {
 	OpenStream() (MsQuicStream, error)
@@ -75,16 +75,26 @@ func (mqc MsQuicConn) Close() error {
 	mqc.openStream.Lock()
 	defer mqc.openStream.Unlock()
 	if !mqc.shutdown.Swap(true) {
+		wg := sync.WaitGroup{}
 		mqc.streams.Range(func(k, v any) bool {
 			println("PANIC1")
-			go v.(MsQuicStream).shutdownClose()
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				v.(MsQuicStream).shutdownClose()
+			}()
 			return true
 		})
 		close(mqc.acceptStreamQueue)
 		for s := range mqc.acceptStreamQueue {
-			println("PANIC12")
-			go s.shutdownClose()
+			println("PANIC2")
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				s.shutdownClose()
+			}()
 		}
+		wg.Wait()
 		cShutdownConnection(mqc.conn)
 	}
 	return nil
@@ -101,13 +111,13 @@ func (mqc MsQuicConn) appClose() error {
 	defer mqc.openStream.Unlock()
 	if !mqc.shutdown.Swap(true) {
 		mqc.streams.Range(func(k, v any) bool {
-			println("PANIC2")
+			println("PANIC3")
 			v.(MsQuicStream).abortClose()
 			return true
 		})
 		close(mqc.acceptStreamQueue)
 		for s := range mqc.acceptStreamQueue {
-			println("PANIC3")
+			println("PANIC4")
 			s.abortClose()
 		}
 	}
@@ -132,14 +142,13 @@ func (mqc MsQuicConn) OpenStream() (MsQuicStream, error) {
 	} else {
 		enable = C.int8_t(0)
 	}
+	_, loaded := mqc.streams.LoadOrStore(stream, res)
+	if loaded {
+		println("PANIC")
+	}
 	if cStartStream(stream, enable) == -1 {
-		mqc.streams.Delete(stream)
+		//mqc.streams.Delete(stream)
 		return MsQuicStream{}, fmt.Errorf("stream start error")
-	} else {
-		_, loaded := mqc.streams.LoadOrStore(stream, res)
-		if loaded {
-			println("PANIC")
-		}
 	}
 	return res, nil
 }
