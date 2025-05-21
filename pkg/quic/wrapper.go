@@ -8,9 +8,11 @@ package quic
 #cgo noescape CreateStream
 #cgo noescape StartStream
 #cgo noescape LoadListenConfiguration
-#cgo noescape Listen
+#cgo noescape CreateListener
+#cgo noescape StartListener
 #cgo noescape CloseListener
-#cgo noescape DialConnection
+#cgo noescape OpenConnection
+#cgo noescape StartConnection
 #cgo noescape MsQuicSetup
 #cgo noescape GetRemoteAddr
 #cgo noescape StreamWrite
@@ -21,9 +23,11 @@ package quic
 #cgo nocallback CreateStream
 #cgo nocallback StartStream
 #cgo nocallback LoadListenConfiguration
-#cgo nocallback Listen
+#cgo nocallback CreateListener
+#cgo nocallback StartListener
 #cgo nocallback CloseListener
-#cgo nocallback DialConnection
+#cgo nocallback OpenConnection
+#cgo nocallback StartConnection
 #cgo nocallback MsQuicSetup
 #cgo nocallback GetRemoteAddr
 #cgo nocallback StreamWrite
@@ -91,6 +95,7 @@ func init() {
 func ListenAddr(addr string, cfg Config) (MsQuicListener, error) {
 	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
+
 		return MsQuicListener{}, err
 	}
 	portInt, _ := strconv.Atoi(port)
@@ -148,12 +153,17 @@ func ListenAddr(addr string, cfg Config) (MsQuicListener, error) {
 
 	}
 
-	listener := C.Listen(cAddr, C.uint16_t(portInt), config, buffer)
+	listener := C.CreateListener(config)
 	if listener == nil {
 		return MsQuicListener{}, fmt.Errorf("error creating listener")
 	}
 	res := newMsQuicListener(listener, config, cKeyFile, cCertFile, cAlpn, cfg.FailOnOpenStream)
 	listeners.Store(listener, res)
+
+	status := C.StartListener(listener, cAddr, C.uint16_t(portInt), buffer)
+	if status != 0 {
+		return MsQuicListener{}, fmt.Errorf("error creating listener")
+	}
 
 	if cfg.TracePerfCounts != nil {
 		go func() {
@@ -198,7 +208,17 @@ func DialAddr(ctx context.Context, addr string, cfg Config) (MsQuicConn, error) 
 	if cfg.EnableDatagramReceive {
 		enableDatagram = C.int(1)
 	}
-	conn := C.DialConnection(cAddr, C.uint16_t(portInt), C.struct_QUICConfig{
+	conn := C.OpenConnection()
+	if conn == nil {
+		return MsQuicConn{}, fmt.Errorf("error creating listener")
+	}
+	res := newMsQuicConn(conn, cfg.FailOnOpenStream)
+	_, load := connections.LoadOrStore(conn, res)
+	if load {
+		println("PANIC already registered connection")
+	}
+
+	C.StartConnection(conn, cAddr, C.uint16_t(portInt), C.struct_QUICConfig{
 		DisableCertificateValidation:  1,
 		MaxBidiStreams:                C.int(cfg.MaxIncomingStreams),
 		IdleTimeoutMs:                 C.int(cfg.MaxIdleTimeout.Milliseconds()),
@@ -208,13 +228,19 @@ func DialAddr(ctx context.Context, addr string, cfg Config) (MsQuicConn, error) 
 		Alpn:                          buffer,
 		EnableDatagramReceive:         enableDatagram,
 	})
-	if conn == nil {
-		return MsQuicConn{}, fmt.Errorf("error creating listener")
+	select {
+	case <-res.startSignal:
+		//case <-time.After(10 * time.Second):
+		//	res.appClose()
+		//	connections.Delete(conn)
+		//	return res, fmt.Errorf("connection start took too long")
 	}
-	res := newMsQuicConn(conn, cfg.FailOnOpenStream)
-	connections.Store(conn, res)
 	return res, nil
 }
+
+//func cGetDOSMode(l C.HQUIC) int {
+//	return int(C.GetDOSMode(l))
+//}
 
 func cCloseListener(listener, config C.HQUIC) {
 	C.CloseListener(listener, config)
@@ -253,35 +279,48 @@ func cStreamReceiveComplete(s C.HQUIC, size C.uint64_t) {
 	C.StreamReceiveComplete(s, size)
 }
 
+func cGetStreamStats(s C.HQUIC) C.QUIC_STREAM_STATISTICS {
+	return C.GetStreamStats(s)
+}
+
+func cGetConnStats(c C.HQUIC) C.QUIC_STATISTICS_V2 {
+	return C.GetConnStats(c)
+}
+
+func cGetListenerStats(l C.HQUIC) C.QUIC_LISTENER_STATISTICS {
+	return C.GetListenerStats(l)
+}
+
 func cGetPerfCounters() []uint64 {
 	counters := make([]uint64, C.QUIC_PERF_COUNTER_MAX)
 	C.GetPerfCounters((*C.uint64_t)(unsafe.SliceData(counters)))
+
 	return counters
 }
 
 func QUICAddrToIPPort(addr *C.QUIC_ADDR) (net.IP, int) {
-    sa := (*C.struct_sockaddr)(unsafe.Pointer(addr))
-    switch sa.sa_family {
-    case C.AF_INET:
-        ipv4 := (*C.struct_sockaddr_in)(unsafe.Pointer(addr))
-        ip := net.IPv4(
-            byte(ipv4.sin_addr.s_addr),
-            byte(ipv4.sin_addr.s_addr>>8),
-            byte(ipv4.sin_addr.s_addr>>16),
-            byte(ipv4.sin_addr.s_addr>>24),
-        )
-        port := int(binary.BigEndian.Uint16((*[2]byte)(unsafe.Pointer(&ipv4.sin_port))[:]))
-        return ip, port
+	sa := (*C.struct_sockaddr)(unsafe.Pointer(addr))
+	switch sa.sa_family {
+	case C.AF_INET:
+		ipv4 := (*C.struct_sockaddr_in)(unsafe.Pointer(addr))
+		ip := net.IPv4(
+			byte(ipv4.sin_addr.s_addr),
+			byte(ipv4.sin_addr.s_addr>>8),
+			byte(ipv4.sin_addr.s_addr>>16),
+			byte(ipv4.sin_addr.s_addr>>24),
+		)
+		port := int(binary.BigEndian.Uint16((*[2]byte)(unsafe.Pointer(&ipv4.sin_port))[:]))
+		return ip, port
 
-    case C.AF_INET6:
-        ipv6 := (*C.struct_sockaddr_in6)(unsafe.Pointer(addr))
-        ip := net.IP((*[16]byte)(unsafe.Pointer(&ipv6.sin6_addr))[:])
-        port := int(binary.BigEndian.Uint16((*[2]byte)(unsafe.Pointer(&ipv6.sin6_port))[:]))
-        return ip, port
+	case C.AF_INET6:
+		ipv6 := (*C.struct_sockaddr_in6)(unsafe.Pointer(addr))
+		ip := net.IP((*[16]byte)(unsafe.Pointer(&ipv6.sin6_addr))[:])
+		port := int(binary.BigEndian.Uint16((*[2]byte)(unsafe.Pointer(&ipv6.sin6_port))[:]))
+		return ip, port
 
-    default:
-        return nil, 0
-    }
+	default:
+		return nil, 0
+	}
 }
 
 // TODO Add windows support

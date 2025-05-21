@@ -19,10 +19,16 @@ type MsQuicListener struct {
 	failOnOpenStream bool
 }
 
-func newMsQuicListener(c C.HQUIC, config C.HQUIC, key, cert, alpn *C.char, failOnOpenStream bool) MsQuicListener {
+func newMsQuicListener(l C.HQUIC, config C.HQUIC, key, cert, alpn *C.char, failOnOpenStream bool) MsQuicListener {
+	//go func() {
+	//	for {
+	//		<-time.After(5 * time.Second)
+	//		println(cGetDOSMode(l))
+	//	}
+	//}()
 	return MsQuicListener{
-		listener:         c,
-		acceptQueue:      make(chan MsQuicConn, 1_000),
+		listener:         l,
+		acceptQueue:      make(chan MsQuicConn, 1000),
 		key:              key,
 		cert:             cert,
 		alpn:             alpn,

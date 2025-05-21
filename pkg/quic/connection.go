@@ -49,7 +49,8 @@ type MsQuicConn struct {
 	shutdown          *atomic.Bool
 	streams           *sync.Map //map[C.HQUIC]MsQuicStream
 	failOpenStream    bool
-	openStream        *sync.Mutex
+	openStream        *sync.RWMutex
+	startSignal       chan struct{}
 }
 
 func newMsQuicConn(c C.HQUIC, failOnOpen bool) MsQuicConn {
@@ -66,26 +67,36 @@ func newMsQuicConn(c C.HQUIC, failOnOpen bool) MsQuicConn {
 		shutdown:          new(atomic.Bool),
 		streams:           new(sync.Map),
 		failOpenStream:    failOnOpen,
-		openStream:        new(sync.Mutex),
+		openStream:        new(sync.RWMutex),
+		startSignal:       make(chan struct{}, 1),
 	}
+}
+
+func (mqc MsQuicConn) waitStart() bool {
+	select {
+	case <-mqc.startSignal:
+		return true
+	case <-mqc.ctx.Done():
+	}
+	return false
 }
 
 func (mqc MsQuicConn) Close() error {
 	mqc.cancel()
-	mqc.openStream.Lock()
-	defer mqc.openStream.Unlock()
 	if !mqc.shutdown.Swap(true) {
-		wg := sync.WaitGroup{}
+		mqc.openStream.Lock()
+		defer mqc.openStream.Unlock()
+		//wg := sync.WaitGroup{}
 		mqc.streams.Range(func(k, v any) bool {
-			println("PANIC1")
-			wg.Add(1)
-			go func() {
-				defer wg.Done()
-				v.(MsQuicStream).shutdownClose()
-			}()
+			//println("PANIC1")
+			//wg.Add(1)
+			//go func() {
+			//defer wg.Done()
+			v.(MsQuicStream).shutdownClose()
+			//}()
 			return true
 		})
-		mqc.streams.Clear()
+		//mqc.streams.Clear()
 		//close(mqc.acceptStreamQueue)
 		//for s := range mqc.acceptStreamQueue {
 		//	println("PANIC2")
@@ -95,7 +106,7 @@ func (mqc MsQuicConn) Close() error {
 		//		s.shutdownClose()
 		//	}()
 		//}
-		wg.Wait()
+		//wg.Wait()
 		cShutdownConnection(mqc.conn)
 	}
 	return nil
@@ -103,20 +114,23 @@ func (mqc MsQuicConn) Close() error {
 
 func (mqc MsQuicConn) peerClose() error {
 	mqc.cancel()
+	mqc.openStream.Lock()
+	defer mqc.openStream.Unlock()
+	//go mqc.Close()
 	return nil
 }
 
 func (mqc MsQuicConn) appClose() error {
 	mqc.cancel()
-	mqc.openStream.Lock()
-	defer mqc.openStream.Unlock()
 	if !mqc.shutdown.Swap(true) {
+		mqc.openStream.Lock()
+		defer mqc.openStream.Unlock()
 		mqc.streams.Range(func(k, v any) bool {
 			println("PANIC3")
 			v.(MsQuicStream).abortClose()
 			return true
 		})
-		mqc.streams.Clear()
+		//mqc.streams.Clear()
 		//close(mqc.acceptStreamQueue)
 		//for s := range mqc.acceptStreamQueue {
 		//	println("PANIC4")
@@ -128,13 +142,14 @@ func (mqc MsQuicConn) appClose() error {
 
 func (mqc MsQuicConn) OpenStream() (MsQuicStream, error) {
 	mqc.openStream.Lock()
-	defer mqc.openStream.Unlock()
 
 	if mqc.ctx.Err() != nil {
+		mqc.openStream.Unlock()
 		return MsQuicStream{}, fmt.Errorf("closed connection")
 	}
 	stream := cCreateStream(mqc.conn)
 	if stream == nil {
+		mqc.openStream.Unlock()
 		return MsQuicStream{}, fmt.Errorf("stream open error")
 	}
 	res := newMsQuicStream(stream, mqc.ctx)
@@ -150,9 +165,21 @@ func (mqc MsQuicConn) OpenStream() (MsQuicStream, error) {
 	}
 	if cStartStream(stream, enable) == -1 {
 		//mqc.streams.Delete(stream)
+		mqc.openStream.Unlock()
 		return MsQuicStream{}, fmt.Errorf("stream start error")
 	}
+	mqc.openStream.Unlock()
+	if !res.waitStart() {
+		return MsQuicStream{}, fmt.Errorf("stream start failed")
+	}
 	return res, nil
+	//select {
+	//case <-res.state.startSignal:
+	//case <-time.After(5 * time.Second):
+	//	//res.abortClose()
+	//	//mqc.streams.Delete(stream)
+	//	return MsQuicStream{}, fmt.Errorf("stream start took too long")
+	//}
 }
 
 func (mqc MsQuicConn) AcceptStream(ctx context.Context) (MsQuicStream, error) {

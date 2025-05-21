@@ -8,6 +8,7 @@ import (
 	"io"
 	"os"
 	"runtime"
+	//"sort"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -37,6 +38,7 @@ type streamState struct {
 	readDeadline     time.Time
 	writeDeadline    time.Time
 	writeAccess      sync.Mutex
+	startSignal      chan struct{}
 }
 
 func (ss *streamState) hasReadData() bool {
@@ -52,6 +54,167 @@ type MsQuicStream struct {
 	peerSignal chan struct{}
 }
 
+func (mqs MsQuicStream) waitStart() bool {
+	select {
+	case <-mqs.state.startSignal:
+		return true
+	case <-mqs.Context().Done():
+	}
+	return false
+}
+
+type statsStruct struct {
+	arr []C.QUIC_STREAM_STATISTICS
+	m   sync.Mutex
+}
+
+var stats atomic.Pointer[statsStruct]
+
+type statsArr []C.QUIC_STREAM_STATISTICS
+
+func (m statsArr) Len() int { return len(m) }
+func (m statsArr) Less(i, j int) bool {
+	iTotal := uint64(m[i].ConnBlockedByAmplificationProtUs) +
+		uint64(m[i].ConnBlockedByCongestionControlUs) +
+		uint64(m[i].ConnBlockedByFlowControlUs) +
+		uint64(m[i].ConnBlockedByPacingUs) +
+		uint64(m[i].ConnBlockedBySchedulingUs) +
+		uint64(m[i].StreamBlockedByAppUs) +
+		uint64(m[i].StreamBlockedByFlowControlUs) +
+		uint64(m[i].StreamBlockedByIdFlowControlUs)
+	jTotal := uint64(m[j].ConnBlockedByAmplificationProtUs) +
+		uint64(m[j].ConnBlockedByCongestionControlUs) +
+		uint64(m[j].ConnBlockedByFlowControlUs) +
+		uint64(m[j].ConnBlockedByPacingUs) +
+		uint64(m[j].ConnBlockedBySchedulingUs) +
+		uint64(m[j].StreamBlockedByAppUs) +
+		uint64(m[j].StreamBlockedByFlowControlUs) +
+		uint64(m[j].StreamBlockedByIdFlowControlUs)
+	return iTotal < jTotal
+}
+func (m statsArr) Swap(i, j int) { m[i], m[j] = m[j], m[i] }
+
+func init() {
+	//go func() {
+	//	for {
+	//		<-time.After(10 * time.Second)
+	//		connections.Range(func(key, value any) bool {
+	//			stats := cGetConnStats(key.(C.HQUIC))
+	//			return true
+	//		})
+	//	}
+	//}()
+
+	//go func() {
+	//	for {
+	//		<-time.After(10 * time.Second)
+	//		listeners.Range(func(key, value any) bool {
+	//			stats := cGetListenerStats(key.(C.HQUIC))
+	//			println("TotalAcceptedConnections", stats.TotalAcceptedConnections)
+	//			println("TotalRejectedConnections", stats.TotalRejectedConnections)
+	//			println("BindingRecvDroppedPackets", stats.BindingRecvDroppedPackets)
+	//			return true
+	//		})
+	//	}
+	//}()
+
+	//ss := statsStruct{
+	//	arr: []C.QUIC_STREAM_STATISTICS{},
+	//	m:   sync.Mutex{},
+	//}
+	//stats.Store(&ss)
+	//go func() {
+	//	for {
+	//		<-time.After(10 * time.Second)
+	//		ssn := statsStruct{
+	//			arr: []C.QUIC_STREAM_STATISTICS{},
+	//			m:   sync.Mutex{},
+	//		}
+	//		oldSS := stats.Swap(&ssn)
+	//		var ConnBlockedByAmplificationProtUs uint64 = 0
+	//		var ConnBlockedByCongestionControlUs uint64 = 0
+	//		var ConnBlockedByFlowControlUs uint64 = 0
+	//		var ConnBlockedByPacingUs uint64 = 0
+	//		var ConnBlockedBySchedulingUs uint64 = 0
+	//		var StreamBlockedByAppUs uint64 = 0
+	//		var StreamBlockedByFlowControlUs uint64 = 0
+	//		var StreamBlockedByIdFlowControlUs uint64 = 0
+	//		oldSS.m.Lock()
+	//		old := oldSS.arr
+	//		mmax := uint64(len(old))
+	//		if mmax == 0 {
+	//			continue
+	//		}
+	//		for i := range old {
+	//			ConnBlockedByAmplificationProtUs += uint64(old[i].ConnBlockedByAmplificationProtUs)
+	//			ConnBlockedByCongestionControlUs += uint64(old[i].ConnBlockedByCongestionControlUs)
+	//			ConnBlockedByFlowControlUs += uint64(old[i].ConnBlockedByFlowControlUs)
+	//			ConnBlockedByPacingUs += uint64(old[i].ConnBlockedByPacingUs)
+	//			ConnBlockedBySchedulingUs += uint64(old[i].ConnBlockedBySchedulingUs)
+	//			StreamBlockedByAppUs += uint64(old[i].StreamBlockedByAppUs)
+	//			StreamBlockedByFlowControlUs += uint64(old[i].StreamBlockedByFlowControlUs)
+	//			StreamBlockedByIdFlowControlUs += uint64(old[i].StreamBlockedByIdFlowControlUs)
+
+	//			total := uint64(old[i].ConnBlockedByAmplificationProtUs) +
+	//				uint64(old[i].ConnBlockedByCongestionControlUs) +
+	//				uint64(old[i].ConnBlockedByFlowControlUs) +
+	//				uint64(old[i].ConnBlockedByPacingUs) +
+	//				uint64(old[i].ConnBlockedBySchedulingUs) +
+	//				uint64(old[i].StreamBlockedByAppUs) +
+	//				uint64(old[i].StreamBlockedByFlowControlUs) +
+	//				uint64(old[i].StreamBlockedByIdFlowControlUs)
+	//			if total == 0 {
+	//				mmax -= 1
+	//			}
+	//		}
+	//		sort.Sort(statsArr(old))
+	//		println("entries:", mmax)
+	//		println("AVG")
+	//		println("ConnBlockedByAmplificationProtUs:", ConnBlockedByAmplificationProtUs/mmax)
+	//		println("ConnBlockedByCongestionControlUs:", ConnBlockedByCongestionControlUs/mmax)
+	//		println("ConnBlockedByFlowControlUs:", ConnBlockedByFlowControlUs/mmax)
+	//		println("ConnBlockedByPacingUs:", ConnBlockedByPacingUs/mmax)
+	//		println("ConnBlockedBySchedulingUs:", ConnBlockedBySchedulingUs/mmax)
+	//		println("StreamBlockedByAppUs:", StreamBlockedByAppUs/mmax)
+	//		println("StreamBlockedByFlowControlUs:", StreamBlockedByFlowControlUs/mmax)
+	//		println("StreamBlockedByIdFlowControlUs:", StreamBlockedByIdFlowControlUs/mmax)
+	//		println("p1")
+	//		i := 0
+	//		println("ConnBlockedByAmplificationProtUs:", old[i].ConnBlockedByAmplificationProtUs)
+	//		println("ConnBlockedByCongestionControlUs:", old[i].ConnBlockedByCongestionControlUs)
+	//		println("ConnBlockedByFlowControlUs:", old[i].ConnBlockedByFlowControlUs)
+	//		println("ConnBlockedByPacingUs:", old[i].ConnBlockedByPacingUs)
+	//		println("ConnBlockedBySchedulingUs:", old[i].ConnBlockedBySchedulingUs)
+	//		println("StreamBlockedByAppUs:", old[i].StreamBlockedByAppUs)
+	//		println("StreamBlockedByFlowControlUs:", old[i].StreamBlockedByFlowControlUs)
+	//		println("StreamBlockedByIdFlowControlUs:", old[i].StreamBlockedByIdFlowControlUs)
+	//		println("p50")
+	//		i = len(old) / 2
+	//		println("ConnBlockedByAmplificationProtUs:", old[i].ConnBlockedByAmplificationProtUs)
+	//		println("ConnBlockedByCongestionControlUs:", old[i].ConnBlockedByCongestionControlUs)
+	//		println("ConnBlockedByFlowControlUs:", old[i].ConnBlockedByFlowControlUs)
+	//		println("ConnBlockedByPacingUs:", old[i].ConnBlockedByPacingUs)
+	//		println("ConnBlockedBySchedulingUs:", old[i].ConnBlockedBySchedulingUs)
+	//		println("StreamBlockedByAppUs:", old[i].StreamBlockedByAppUs)
+	//		println("StreamBlockedByFlowControlUs:", old[i].StreamBlockedByFlowControlUs)
+	//		println("StreamBlockedByIdFlowControlUs:", old[i].StreamBlockedByIdFlowControlUs)
+	//		println("p99")
+	//		i = len(old) - 1
+	//		println("ConnBlockedByAmplificationProtUs:", old[i].ConnBlockedByAmplificationProtUs)
+	//		println("ConnBlockedByCongestionControlUs:", old[i].ConnBlockedByCongestionControlUs)
+	//		println("ConnBlockedByFlowControlUs:", old[i].ConnBlockedByFlowControlUs)
+	//		println("ConnBlockedByPacingUs:", old[i].ConnBlockedByPacingUs)
+	//		println("ConnBlockedBySchedulingUs:", old[i].ConnBlockedBySchedulingUs)
+	//		println("StreamBlockedByAppUs:", old[i].StreamBlockedByAppUs)
+	//		println("StreamBlockedByFlowControlUs:", old[i].StreamBlockedByFlowControlUs)
+	//		println("StreamBlockedByIdFlowControlUs:", old[i].StreamBlockedByIdFlowControlUs)
+	//		oldSS.m.Unlock()
+	//	}
+
+	//}()
+
+}
+
 func newMsQuicStream(s C.HQUIC, connCtx context.Context) MsQuicStream {
 	ctx, cancel := context.WithCancel(connCtx)
 	res := MsQuicStream{
@@ -63,10 +226,12 @@ func newMsQuicStream(s C.HQUIC, connCtx context.Context) MsQuicStream {
 			readDeadline:  time.Time{},
 			writeDeadline: time.Time{},
 			shutdown:      atomic.Bool{},
+			startSignal:   make(chan struct{}, 1),
 		},
 		readSignal: make(chan struct{}, 1),
 		peerSignal: make(chan struct{}, 1),
 	}
+
 	return res
 }
 
@@ -96,8 +261,8 @@ func (mqs MsQuicStream) Read(data []byte) (int, error) {
 	}
 
 	state.readBufferAccess.Lock()
-	defer state.readBufferAccess.Unlock()
 	n, err := state.readBuffer.Read(data)
+	state.readBufferAccess.Unlock()
 	nn := int64(n)
 	state.availBytes.Add(-nn)
 	if n == 0 { // ignore io.EOF
@@ -246,14 +411,28 @@ func (mqs MsQuicStream) appClose() error {
 	mqs.cancel()
 	mqs.state.writeAccess.Lock()
 	defer mqs.state.writeAccess.Unlock()
+	mqs.state.readBufferAccess.Lock()
+	defer mqs.state.readBufferAccess.Unlock()
 	mqs.state.shutdown.Store(true)
+
+	//stat := cGetStreamStats(mqs.stream)
+
+	//oldSS := stats.Load()
+	//oldSS.m.Lock()
+	//defer oldSS.m.Unlock()
+	//oldSS.arr = append(oldSS.arr, stat)
+
 	return nil
 }
 
 func (mqs MsQuicStream) shutdownClose() error {
+
 	mqs.cancel()
 	mqs.state.writeAccess.Lock()
 	defer mqs.state.writeAccess.Unlock()
+	mqs.state.readBufferAccess.Lock()
+	defer mqs.state.readBufferAccess.Unlock()
+
 	if !mqs.state.shutdown.Swap(true) {
 		cShutdownStream(mqs.stream)
 		select {
@@ -270,6 +449,8 @@ func (mqs MsQuicStream) abortClose() error {
 	mqs.cancel()
 	mqs.state.writeAccess.Lock()
 	defer mqs.state.writeAccess.Unlock()
+	mqs.state.readBufferAccess.Lock()
+	defer mqs.state.readBufferAccess.Unlock()
 	if !mqs.state.shutdown.Swap(true) {
 		cAbortStream(mqs.stream)
 	}

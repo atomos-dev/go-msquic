@@ -18,7 +18,10 @@ extern void newReadCallback(HQUIC, HQUIC, const QUIC_BUFFER*, uint32_t len);
 extern void closeConnectionCallback(HQUIC);
 extern void closePeerConnectionCallback(HQUIC);
 extern void closeStreamCallback(HQUIC,HQUIC);
+extern void abortStreamCallback(HQUIC,HQUIC);
 extern void ackPeerStreamCallback(HQUIC,HQUIC);
+extern void startStreamCallback(HQUIC,HQUIC);
+extern void startConnectionCallback(HQUIC);
 
 HQUIC Registration = NULL;
 const QUIC_API_TABLE* MsQuic = NULL;
@@ -75,6 +78,9 @@ StreamCallback(
     )
 {
     switch (Event->Type) {
+	case QUIC_STREAM_EVENT_START_COMPLETE:
+		startStreamCallback(Context, Stream);
+		break;
     case QUIC_STREAM_EVENT_SEND_COMPLETE:
 		if  (Event->SEND_COMPLETE.ClientContext) {
 			free(Event->SEND_COMPLETE.ClientContext);
@@ -94,15 +100,15 @@ StreamCallback(
         break;
 	case QUIC_STREAM_EVENT_PEER_RECEIVE_ABORTED:
     case QUIC_STREAM_EVENT_PEER_SEND_ABORTED:
-    case QUIC_STREAM_EVENT_SEND_SHUTDOWN_COMPLETE:
+    //case QUIC_STREAM_EVENT_SEND_SHUTDOWN_COMPLETE:
         //
         // The peer aborted its send direction of the stream.
         //
 		if (LOGS_ENABLED) {
 			printf("[strm][%p] Peer aborted\n", Stream);
 		}
-		closeStreamCallback(Context, Stream);
-        MsQuic->StreamShutdown(Stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
+		abortStreamCallback(Context, Stream);
+        //MsQuic->StreamShutdown(Stream, QUIC_STREAM_SHUTDOWN_FLAG_ABORT, 0);
         break;
     case QUIC_STREAM_EVENT_SHUTDOWN_COMPLETE:
         //
@@ -152,9 +158,9 @@ CreateStream(
     QUIC_STATUS Status;
     HQUIC Stream = NULL;
 
-	if (LOGS_ENABLED) {
-		printf("[strm][%p] Created...\n", Stream);
-	}
+	//if (LOGS_ENABLED) {
+		//printf("[strm][%p] Creating for...\n", Connection);
+	//}
 
     if (QUIC_FAILED(Status = MsQuic->StreamOpen(Connection, QUIC_STREAM_OPEN_FLAG_NONE, StreamCallback, Connection, &Stream))) {
         printf("StreamOpen failed, 0x%x!\n", Status);
@@ -179,6 +185,7 @@ StartStream(
 		flag = QUIC_STREAM_START_FLAG_FAIL_BLOCKED;
 	}
 	flag |= QUIC_STREAM_START_FLAG_SHUTDOWN_ON_FAIL;
+	flag |= QUIC_STREAM_START_FLAG_IMMEDIATE;
 
     QUIC_STATUS Status;
     if (QUIC_FAILED(Status = MsQuic->StreamStart(Stream, flag))) {
@@ -211,6 +218,7 @@ ConnectionCallback(
 		if (LOGS_ENABLED) {
 			printf("[conn][%p] Connected\n", Connection);
 		}
+		startConnectionCallback(Connection);
         MsQuic->ConnectionSendResumptionTicket(Connection, QUIC_SEND_RESUMPTION_FLAG_NONE, 0, NULL);
         break;
     case QUIC_CONNECTION_EVENT_SHUTDOWN_INITIATED_BY_TRANSPORT:
@@ -234,6 +242,7 @@ ConnectionCallback(
 		if (LOGS_ENABLED) {
 			printf("[conn][%p] done\n", Connection);
 		}
+		//printf("shutting down for %p\n", Connection);
 		closeConnectionCallback(Connection);
 		if (!Event->SHUTDOWN_COMPLETE.AppCloseInProgress) {
 			MsQuic->ConnectionClose(Connection);
@@ -243,13 +252,13 @@ ConnectionCallback(
 		if (LOGS_ENABLED) {
 				printf("[strm][%p] Peer started\n", Event->PEER_STREAM_STARTED.Stream);
 		}
-        MsQuic->SetCallbackHandler(Event->PEER_STREAM_STARTED.Stream, (void*)StreamCallback, Connection);
 		newStreamCallback(Connection, Event->PEER_STREAM_STARTED.Stream);
+        MsQuic->SetCallbackHandler(Event->PEER_STREAM_STARTED.Stream, (void*)StreamCallback, Connection);
         break;
     case QUIC_CONNECTION_EVENT_RESUMED:
-		if (LOGS_ENABLED) {
-			printf("[conn][%p] Connection resumed!\n", Connection);
-		}
+		//if (LOGS_ENABLED) {
+			printf("[conn][%p] TODO Connection resumed!\n", Connection);
+		//}
         break;
     default:
         break;
@@ -270,17 +279,13 @@ ListenerCallback(
     QUIC_STATUS Status = QUIC_STATUS_NOT_SUPPORTED;
     switch (Event->Type) {
     case QUIC_LISTENER_EVENT_NEW_CONNECTION:
-        Status = MsQuic->ConnectionSetConfiguration(Event->NEW_CONNECTION.Connection, (HQUIC)Context);
-		if (LOGS_ENABLED) {
-			printf("[conn][%p] new connection\n", Event->NEW_CONNECTION.Connection);
-		}
-		if (QUIC_SUCCEEDED(Status)) {
-			MsQuic->SetCallbackHandler(Event->NEW_CONNECTION.Connection, (void*)ConnectionCallback, Context);
-			newConnectionCallback(Listener, Event->NEW_CONNECTION.Connection);
-		} else {
-			printf("[conn][%p] new connection failed\n", Event->NEW_CONNECTION.Connection);
-			MsQuic->ConnectionShutdown(Event->NEW_CONNECTION.Connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
-		}
+		newConnectionCallback(Listener, Event->NEW_CONNECTION.Connection);
+		MsQuic->SetCallbackHandler(Event->NEW_CONNECTION.Connection, (void*)ConnectionCallback, Context);
+		Status = MsQuic->ConnectionSetConfiguration(Event->NEW_CONNECTION.Connection, (HQUIC)Context);
+		//} else {
+		//	printf("[conn][%p] new connection failed\n", Event->NEW_CONNECTION.Connection);
+		//	MsQuic->ConnectionShutdown(Event->NEW_CONNECTION.Connection, QUIC_CONNECTION_SHUTDOWN_FLAG_NONE, 0);
+		//}
         break;
     default:
         break;
@@ -361,11 +366,8 @@ LoadListenConfiguration(
 }
 
 HQUIC
-Listen(
-	_In_ const char* addr,
-	_In_ uint16_t port,
-	_In_ HQUIC configuration,
-	_In_ QUIC_BUFFER Alpn
+CreateListener(
+	_In_ HQUIC configuration
 )
 {
     QUIC_STATUS Status;
@@ -376,6 +378,19 @@ Listen(
 		return listener;
     }
 
+	return listener;
+}
+
+int
+StartListener(
+    _In_ HQUIC listener,
+	_In_ const char* addr,
+	_In_ uint16_t port,
+	_In_ QUIC_BUFFER Alpn
+)
+{
+    QUIC_STATUS Status;
+
     QUIC_ADDR quicAddr = {0};
 	customQuicAddrFromString(addr, port, &quicAddr);
     customQuicAddrSetFamily(&quicAddr, QUIC_ADDRESS_FAMILY_UNSPEC);
@@ -383,14 +398,14 @@ Listen(
 
     if (QUIC_FAILED(Status = MsQuic->ListenerStart(listener, &Alpn, 1, &quicAddr))) {
         printf("ListenerStart failed, 0x%x!\n", Status);
-		return listener;
+		return -1;
     }
 
 	if (LOGS_ENABLED) {
 		printf("Listen to %s:%d\n", addr, port);
 	}
 
-	return listener;
+	return 0;
 }
 
 void CloseListener(HQUIC listener, HQUIC configuration) {
@@ -446,7 +461,22 @@ LoadDialConfiguration(struct QUICConfig cfg)
 }
 
 HQUIC
-DialConnection(
+OpenConnection()
+{
+    QUIC_STATUS Status;
+    HQUIC connection = NULL;
+
+    if (QUIC_FAILED(Status = MsQuic->ConnectionOpen(Registration, ConnectionCallback, NULL, &connection))) {
+        printf("ConnectionOpen failed, 0x%x!\n", Status);
+		return NULL;
+    }
+
+	return connection;
+}
+
+void
+StartConnection(
+	_In_ HQUIC connection ,
 	_In_ const char* addr,
 	_In_ uint16_t port,
 	_In_ struct QUICConfig cfg
@@ -456,29 +486,15 @@ DialConnection(
 
     HQUIC configuration = LoadDialConfiguration(cfg);
 	if (!configuration) {
-        return NULL;
+        return;
     }
-
-    HQUIC connection = NULL;
-
-    if (QUIC_FAILED(Status = MsQuic->ConnectionOpen(Registration, ConnectionCallback, NULL, &connection))) {
-        printf("ConnectionOpen failed, 0x%x!\n", Status);
-		return NULL;
-    }
-
-	if (LOGS_ENABLED) {
-		printf("[conn][%p] Connect to %s\n", connection, addr);
-	}
 
     if (QUIC_FAILED(Status = MsQuic->ConnectionStart(connection, configuration, QUIC_ADDRESS_FAMILY_UNSPEC,
 		addr, port))) {
         printf("ConnectionStart failed, 0x%x!\n", Status);
         MsQuic->ConnectionClose(connection);
-		return NULL;
+		return;
     }
-
-	return connection;
-
 }
 
 static const QUIC_REGISTRATION_CONFIG RegConfig = { "go-msquic", QUIC_EXECUTION_PROFILE_LOW_LATENCY };
@@ -534,13 +550,49 @@ int GetPerfCounters(uint64_t *Counters) {
 	return CxPlatProcessorCount;
 }
 
-//int GetDOSMode(HQUIC l, uint64_t *Counters) {
-//	uint32_t BufferLength = sizeof(uint64_t)*QUIC_PERF_COUNTER_MAX;
+//int GetDOSMode(HQUIC l) {
 //	BOOLEAN dos_mode;
+//	uint32_t size = sizeof(dos_mode);
 //	MsQuic->GetParam(
 //		l,
 //		QUIC_PARAM_DOS_MODE_EVENTS,
-//		&dos_mode,
-//		sizeof(BOOLEAN));
-//	return CxPlatProcessorCount;
+//		&size,
+//		&dos_mode);
+//	return dos_mode;
 //}
+
+QUIC_STREAM_STATISTICS
+GetStreamStats(HQUIC s) {
+	QUIC_STREAM_STATISTICS res = {0};
+	uint32_t size = sizeof(res);
+	MsQuic->GetParam(
+		s,
+		QUIC_PARAM_STREAM_STATISTICS,
+		&size,
+		&res);
+	return res;
+}
+
+QUIC_STATISTICS_V2
+GetConnStats(HQUIC c) {
+	QUIC_STATISTICS_V2 res = {0};
+	uint32_t size = sizeof(res);
+	MsQuic->GetParam(
+		c,
+		QUIC_PARAM_CONN_STATISTICS_V2,
+		&size,
+		&res);
+	return res;
+}
+
+QUIC_LISTENER_STATISTICS
+GetListenerStats(HQUIC l) {
+	QUIC_LISTENER_STATISTICS res = {0};
+	uint32_t size = sizeof(res);
+	MsQuic->GetParam(
+		l,
+		QUIC_PARAM_LISTENER_STATS,
+		&size,
+		&res);
+	return res;
+}
