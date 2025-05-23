@@ -5,7 +5,11 @@ import (
 	"unsafe"
 )
 
-// #include "msquic.h"
+/*
+#cgo CFLAGS: -I${SRCDIR}/../../../msquic/src -I${SRCDIR}/../../../msquic/src/inc
+#cgo LDFLAGS: -L${SRCDIR}/../../../lib -l:libmsquic.a -ldl -lnuma -lpthread
+#include "msquic.h"
+*/
 import "C"
 
 //export newConnectionCallback
